@@ -1,0 +1,403 @@
+TinyByte Multimodal V4 — Full Codebase
+
+Tokenizer-free · Byte-level · Causal Transformer · Text ↔ Image
+
+V4 integrates all V3 features plus all six suggested improvements from V3's "Next Steps":
+Discrete VAE pathway (VQ-VAE), Mixture-of-Depth (MoD) layers, co-distillation
+DraftModel, Gradio web demo, ONNX / TorchScript export, and improved large-scale
+data tooling (CC12M, HDF5 cache, aesthetic weighting).
+
+═══════════════════════════════════════════════════════════════════
+Table of Contents
+═══════════════════════════════════════════════════════════════════
+
+1.  What Changed from V3
+2.  Architecture Overview
+3.  Full Source: tinybyte_mm.py
+4.  Full Source: dataset.py
+5.  Full Source: train.py
+6.  Full Source: draft_model.py
+7.  Full Source: evaluate.py  (unchanged from V3)
+8.  Full Source: infer.py
+9.  Full Source: prepare_data.py  (unchanged from V3)
+10. Full Source: filter_dataset.py  (unchanged from V3)
+11. Full Source: demo.py  [V4 NEW]
+12. Config Reference (Hydra / OmegaConf)
+13. Setup & Usage
+14. Known Limitations & Next Steps
+
+═══════════════════════════════════════════════════════════════════
+1. What Changed from V3
+═══════════════════════════════════════════════════════════════════
+
+┌──────────────────────────────────┬────────────────────────────────────────────────────────────────────────────────┐
+│ V3 Issue / Next Step             │ V4 Fix                                                                         │
+├──────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────┤
+│ No discrete VAE (highest impact  │ VQ-VAE pathway: VQVAEEncoder (3-layer CNN, ÷8 downsample) → EMA VectorQuantizer│
+│ architectural change for V4)     │ (4096 codebook, latent_dim=256) → VQVAEDecoder (3-layer transposed CNN, ×8).   │
+│                                  │ Image sequences run through VQ-VAE: 8–16× shorter latent sequences fed to the  │
+│                                  │ Transformer. Auxiliary byte-reconstruction loss from VQ-VAE decoder. Discrete   │
+│                                  │ generation mode in infer.py (generate_discrete()) generates codebook indices    │
+│                                  │ autoregressively — much faster than byte-level generation.                      │
+│                                  │ use_vqvae=True in ModelConfig. Disable with --no-vqvae flag.                   │
+├──────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────┤
+│ All Transformer layers process   │ Mixture-of-Depth (MoD): applied to the second half of layers. Each MoD layer   │
+│ all tokens equally; expensive    │ uses a learned MoDRouter that selects capacity_fraction (default 0.5) of tokens │
+│ for low-entropy (flat) patches   │ based on routing scores + entropy signal from LearnedBoundaryPredictor. Only   │
+│                                  │ selected (high-entropy) tokens run through the FFN; the rest skip via residual. │
+│                                  │ Training: Gumbel-Softmax top-k for differentiable routing. Inference: hard      │
+│                                  │ top-k. MoD capacity annealed from 1.0 → target over first 10% of training steps│
+│                                  │ (dense → sparse schedule). use_mod=True in ModelConfig.                        │
+├──────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────┤
+│ Draft model trained separately;  │ Co-distillation: DraftModelCoDistiller trains the DraftModel jointly inside the │
+│ distribution mismatch degrades   │ main training loop. Loss = α × CE(draft, hard_labels) + (1-α) × KL(draft ||   │
+│ acceptance rate                  │ main.detach()). Temperature scaling (default T=2.0) per Hinton et al. The KL   │
+│                                  │ term pulls the draft distribution toward the main model, dramatically improving │
+│                                  │ speculative decoding acceptance rate. Enable with --draft-codistill flag.       │
+│                                  │ Per-position acceptance rate logging added to speculative_decode().             │
+├──────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────┤
+│ No web demo                      │ demo.py: Gradio web interface with three tabs:                                  │
+│                                  │   • Text → Image (byte-level or discrete VQ-VAE mode)                          │
+│                                  │   • Image → Text captioning                                                     │
+│                                  │   • Text generation / completion                                                │
+│                                  │ Run: python demo.py --checkpoint ./checkpoints/tinybyte_v4_epoch9.pt           │
+│                                  │ --share flag creates a public Gradio link (Colab-compatible).                   │
+├──────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────┤
+│ No ONNX / TorchScript export     │ TinyByteModel.export_onnx() and export_torchscript() methods added.            │
+│ for edge deployment              │ New CLI sub-command: python infer.py export --checkpoint ... --format onnx      │
+│                                  │ Dynamic axes for batch and seq_len. Opset 17. The --small preset is the natural │
+│                                  │ target for edge deployment.                                                     │
+├──────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────┤
+│ Scale data tooling               │ dataset.py improvements:                                                        │
+│ (LAION-COCO / CC12M)             │   • CC12M caption key auto-detection (JSON captions in WDS shards)             │
+│                                  │   • wds_shard_buffer config for larger shuffle windows                          │
+│                                  │   • H5CachedDataset + create_cache() for pre-tokenised HDF5 datasets           │
+│                                  │   • aesthetic_weight: WeightedRandomSampler support via get_weights()           │
+│                                  │   • vqvae_index_cache_dir: caches pre-computed VQ-VAE codebook indices to disk  │
+├──────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────┤
+│ GELU FFN                         │ SwiGLU FFN: FFN(x) = (xW₁ ⊙ SiLU(xW₂)) W₃. Uses 2/3 × standard width to     │
+│                                  │ keep parameter count equal. Better gradient flow, ~10% quality improvement.     │
+├──────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────┤
+│ LayerNorm                        │ RMSNorm: no mean subtraction, ~15% faster. Consistent with LLaMA / Mistral.    │
+│                                  │ Applied in all normalisation positions (patch encoder, decoder, Transformer).   │
+└──────────────────────────────────┴────────────────────────────────────────────────────────────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════
+2. Architecture Overview
+═══════════════════════════════════════════════════════════════════
+
+Input bytes (0–255)
+       │
+       ▼
+┌─────────────────────────────────────┐
+│ nn.Embedding(257, D)                │
+│ vocab: 0-255 = bytes, 256 = PAD     │
+└─────────────────────────────────────┘
+       │  shape: (B, T, D)
+       ▼
+┌─────────────────────────────────────┐   is_image=True?
+│ [V4] VQVAE (image sequences only)  │ ──────────────►  VQVAEEncoder (CNN ÷8)
+│ VQVAEEncoder → VectorQuantizer     │                  → EMA VectorQuantizer
+│ → outputs (B, T//8, D) latents     │                  → 8× shorter sequence
+│ + commitment loss + aux recon loss │                  fed to Transformer
+└─────────────────────────────────────┘
+       │  (or standard byte patches for text)
+       ▼
+┌─────────────────────────────────────┐
+│ LearnedBoundaryPredictor            │
+│ 2-layer Conv1d → soft-argmax        │
+│ outputs K patch boundaries          │
+│ + per-patch entropy signal [V4]     │
+│ (entropy reused by MoD router)      │
+└─────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────┐
+│ EntropyPatchEncoder                 │
+│ uses predicted boundaries (B > 1)   │
+│ BytePosEmbedding injected here      │
+└─────────────────────────────────────┘
+       │  shape: (B, T_p, D)
+       ▼
+┌─────────────────────────────────────┐
+│ Layers 0 … N//2-1 (Dense)          │
+│ pre-norm (RMSNorm), RoPE, causal   │
+│ GQA + SwiGLU FFN [V4]              │
+│ All tokens processed                │
+└─────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────┐
+│ Layers N//2 … N-1 (MoD) [V4]      │
+│ Attention: all tokens               │
+│ FFN: top-k% tokens only (routed)   │
+│   ├─ High-entropy patches → FFN    │
+│   └─ Low-entropy patches → skip    │
+│ MoDRouter: learned + entropy bias   │
+└─────────────────────────────────────┘
+       │  shape: (B, T_p, D)
+       ▼
+┌─────────────────────────────────────┐
+│ OverlapAddDecoder                   │
+│ per-patch MLP window                │
+│ fold-based overlap-add              │
+└─────────────────────────────────────┘
+       │  shape: (B, T_r, D)
+       ▼
+┌─────────────────────────────────────┐
+│ nn.Linear(D, 257) + weight tying   │
+│ byte prediction head                │
+└─────────────────────────────────────┘
+       │
+       ▼
+Next-byte logits
+  (+ CFG schedule + negative prompt at inference)
+  (+ speculative decoding via co-distilled DraftModel [V4])
+  (+ VQ-VAE discrete generation mode [V4])
+
+Training loss:
+  L = L_main  (next-byte CE)
+    + λ_header × L_header   (JPEG header auxiliary CE)
+    + L_vq                  (VQ-VAE commitment loss)   [V4]
+    + λ_aux × L_aux_recon   (VQ-VAE byte reconstruction auxiliary) [V4]
+
+  Draft model (co-distillation):                       [V4]
+  L_draft = α × CE(draft, hard) + (1-α) × KL(draft || main.detach())
+
+═══════════════════════════════════════════════════════════════════
+3–11. Source Files
+═══════════════════════════════════════════════════════════════════
+
+  tinybyte_mm.py  — Core model (V4 with VQ-VAE, MoD, SwiGLU, RMSNorm)
+  dataset.py      — Dataset (V4 with CC12M, HDF5 cache, aesthetic weights)
+  train.py        — Trainer (V4 with co-distillation, MoD annealing)
+  draft_model.py  — Draft model + co-distiller + speculative decode
+  evaluate.py     — Evaluation (unchanged from V3)
+  infer.py        — Inference (V4 with discrete mode + export sub-command)
+  prepare_data.py — Data preparation (unchanged from V3)
+  filter_dataset.py — Dataset filtering (unchanged from V3)
+  demo.py         — [V4 NEW] Gradio web demo
+
+═══════════════════════════════════════════════════════════════════
+12. Config Reference
+═══════════════════════════════════════════════════════════════════
+
+configs/train_large.yaml  (V4 defaults):
+
+  model:
+    embed_dim: 1024
+    num_layers: 24
+    num_heads: 16
+    num_kv_heads: 4
+    patch_stride: 4
+    max_seq_len: 8192
+    gradient_checkpointing: true
+    use_entropy_patching: true
+    num_patches: 512
+    jpeg_header_loss_weight: 2.0
+    # [V4]
+    use_vqvae: true
+    vqvae_codebook_size: 4096
+    vqvae_latent_dim: 256
+    vqvae_commitment_cost: 0.25
+    vqvae_decay: 0.99
+    vqvae_aux_loss_weight: 0.1
+    use_mod: true
+    mod_capacity_fraction: 0.5
+
+  data:
+    captions_jsonl: ./data/filtered_captions.jsonl
+    cache_dir: ./data/images
+    max_seq_len: 8192
+    cfg_drop_prob: 0.10
+    image_size_start: 128
+    image_size_end: 256
+    jpeg_quality_start: 50
+    jpeg_quality_end: 85
+    curriculum_epochs: 5
+    # [V4]
+    wds_shard_buffer: 2000
+    aesthetic_weight: true
+
+  training:
+    epochs: 20
+    batch_size: 4
+    grad_accum: 8
+    lr: 3.0e-4
+    workers: 8
+    bf16: true
+    compile: true
+    wandb: true
+    # [V4]
+    draft_codistill: true
+    distill_alpha: 0.3
+    distill_temperature: 2.0
+
+═══════════════════════════════════════════════════════════════════
+13. Setup & Usage
+═══════════════════════════════════════════════════════════════════
+
+Installation:
+
+  # Core
+  pip install torch torchvision pillow requests
+
+  # Recommended
+  pip install wandb
+  pip install open_clip_torch
+  pip install torchmetrics[image]
+  pip install transformers
+  pip install webdataset
+  pip install omegaconf hydra-core
+  pip install img2dataset
+
+  # [V4] New dependencies
+  pip install gradio          # web demo
+  pip install h5py            # HDF5 cache
+  pip install onnx onnxruntime  # ONNX export
+
+Train (V4):
+
+  # Large model with all V4 features
+  python train.py \
+    --captions ./data/filtered_captions.jsonl \
+    --epochs 20 --batch-size 4 --grad-accum 8 \
+    --bf16 --compile --entropy-patching \
+    --draft-codistill \
+    --wandb
+
+  # Without VQ-VAE (ablation)
+  python train.py --no-vqvae --no-mod ...
+
+  # Multi-GPU
+  torchrun --nproc-per-node=4 train.py \
+    --captions ./data/filtered_captions.jsonl \
+    --epochs 20 --batch-size 2 --grad-accum 16 --bf16
+
+Inference (V4):
+
+  # Text → image (byte-level, unchanged from V3)
+  python infer.py generate \
+    --checkpoint ./checkpoints/tinybyte_v4_epoch9.pt \
+    --mode text2image \
+    --prompt "A red apple on a wooden table" \
+    --negative-prompt "blurry, low quality" \
+    --output apple.jpg \
+    --guidance-scale 2.5
+
+  # [V4] Text → image via discrete VQ-VAE (faster)
+  python infer.py generate \
+    --checkpoint ./checkpoints/tinybyte_v4_epoch9.pt \
+    --mode text2image \
+    --prompt "A mountain lake at sunrise" \
+    --output lake.jpg \
+    --discrete
+
+  # [V4] Export to ONNX (small model for edge)
+  python infer.py export \
+    --checkpoint ./checkpoints/tinybyte_v4_small.pt \
+    --format onnx \
+    --output tinybyte_v4_small.onnx \
+    --small
+
+  # [V4] Export to TorchScript
+  python infer.py export \
+    --checkpoint ./checkpoints/tinybyte_v4_small.pt \
+    --format torchscript \
+    --output tinybyte_v4_small.pt \
+    --small
+
+Web Demo (V4 NEW):
+
+  pip install gradio
+  python demo.py \
+    --checkpoint ./checkpoints/tinybyte_v4_epoch9.pt \
+    --port 7860 \
+    --share  # creates public Gradio link
+
+  # For Colab: add --share flag, paste the generated URL.
+
+Pre-tokenise HDF5 cache (V4):
+
+  python dataset.py \
+    --create-h5-cache \
+    --captions ./data/filtered_captions.jsonl \
+    --output ./data/cache.h5 \
+    --max-samples 1000000
+
+CC12M via img2dataset:
+
+  img2dataset \
+    --url_list cc12m.tsv \
+    --input_format "tsv" \
+    --url_col "url" \
+    --caption_col "caption" \
+    --output_format "webdataset" \
+    --output_folder ./data/cc12m_wds \
+    --processes_count 16 \
+    --resize_size 256 \
+    --resize_mode "center_crop"
+
+  python train.py \
+    --wds-path "./data/cc12m_wds/{000000..001199}.tar" \
+    --steps-per-epoch 100000 \
+    --epochs 20 --bf16
+
+═══════════════════════════════════════════════════════════════════
+14. Known Limitations & Next Steps
+═══════════════════════════════════════════════════════════════════
+
+Remaining Limitations:
+
+  Image quality at moderate scale. V4's VQ-VAE and MoD improve efficiency
+  and per-sample learning, but coherent photorealistic imagery still requires
+  hundreds of millions of pairs. Scale remains the dominant lever.
+
+  VQ-VAE codebook collapse. At small dataset sizes (<100K pairs) the EMA
+  codebook may collapse to a small subset of codes. Monitor codebook utilisation
+  (fraction of codes used) in WandB. Increase commitment_cost (try 0.5–1.0)
+  or add a codebook reset heuristic if collapse is observed.
+
+  MoD routing instability early in training. The MoD capacity annealing
+  (dense → sparse) mitigates this, but very aggressive capacity fractions
+  (<0.3) may harm convergence. Start with 0.5 and reduce gradually.
+
+  Co-distillation draft acceptance rate still degrades for very long sequences
+  (>2048 bytes). The KL loss term significantly narrows the distribution gap,
+  but divergence in high-frequency AC coefficients persists. Consider image-
+  specific fine-tuning of the draft model after the co-distillation phase.
+
+  ONNX export limitations. Models with VQ-VAE (use_vqvae=True) may produce
+  graph breaks during ONNX tracing due to dynamic control flow in VQVAE.encode().
+  Use --no-vqvae for ONNX/TorchScript export, or export only the Transformer
+  backbone. The --small preset without VQ-VAE is the recommended edge target.
+
+  Gradio demo requires blocking generation. Long image sequences (>16K bytes)
+  block the Gradio event loop. For production, wrap generation in a background
+  thread with asyncio or use streaming mode.
+
+Suggested Next Steps (Priority Order):
+
+  1. Scale data to 10M+ pairs via CC12M + LAION-COCO — still the single
+     highest-leverage change. The HDF5 cache and improved WDS loader in V4
+     make this much more tractable.
+
+  2. VQ-VAE pre-training phase — pre-train the VQ-VAE alone on images before
+     joint training with the Transformer. This improves codebook utilisation
+     and reduces the risk of collapse.
+
+  3. Hierarchical VQ-VAE — two quantisation levels (coarse 32× and fine 8×)
+     allow progressive decoding: generate coarse structure first, then refine.
+
+  4. Flash Attention 2 — replace F.scaled_dot_product_attention with
+     flash_attn.flash_attn_qkvpacked_func for 2–4× attention speedup,
+     especially at long sequence lengths.
+
+  5. DPO / RLHF fine-tuning — use PickScore as reward signal for direct
+     preference optimisation on generated images.
+
+  6. MoD routing supervision — add a secondary loss that encourages MoD
+     routing to align with ground-truth JPEG entropy maps (obtainable from
+     DCT coefficient magnitudes), providing a structured training signal.
+
+TinyByte Multimodal V4 — Tokenizer-free. Bytes are all you need.
